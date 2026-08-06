@@ -5,15 +5,110 @@ import { Flame, Play, Camera, Settings, Beer, Users, Heart, MessageCircle, Share
 // Base #FAFAF8 · Card #FFF · Dark #111
 // K-red #EF3E4A · Violet #6246EA · Teal #2EC4B6 · Gold #FFBE0B
 
-// ─── KOREAN TTS ───────────────────────────────────────────────────
-function speakKorean(text: string) {
+// ─── KOREAN TTS (robust, cross-browser) ──────────────────────────
+// Fix 1: preload voices async (Chrome loads voices late)
+// Fix 2: pick exact ko-KR voice; fallback to any ko-* voice
+// Fix 3: iOS Safari — never cancel() before speak(), use resume()
+// Fix 4: speaking state for visual feedback
+// Fix 5: graceful fallback when no Korean voice found
+
+let _koVoice: SpeechSynthesisVoice | null = null;
+let _voicesReady = false;
+
+function _loadVoices() {
   if (!window.speechSynthesis) return;
-  window.speechSynthesis.cancel();
+  const voices = window.speechSynthesis.getVoices();
+  if (voices.length === 0) return;
+  _koVoice = voices.find(v => v.lang === 'ko-KR')
+           || voices.find(v => v.lang === 'ko_KR')
+           || voices.find(v => v.lang.toLowerCase().startsWith('ko'))
+           || null;
+  _voicesReady = true;
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('load', _loadVoices);
+  if (window.speechSynthesis) {
+    window.speechSynthesis.onvoiceschanged = _loadVoices;
+    _loadVoices();
+  }
+}
+
+const _speakListeners = new Set<(v:boolean)=>void>();
+let _isSpeaking = false;
+function _setSpeaking(v: boolean) {
+  _isSpeaking = v;
+  _speakListeners.forEach(fn => fn(v));
+}
+
+function speakKorean(text: string) {
+  if (typeof window === 'undefined' || !window.speechSynthesis) return;
+  // iOS Safari fix: resume if paused before speaking
+  if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+  // Don't cancel on iOS — causes silent failure. Stop gracefully.
+  try { window.speechSynthesis.cancel(); } catch(_) {}
+
+  // If voices not yet loaded, wait and retry once
+  if (!_voicesReady) {
+    _loadVoices();
+    setTimeout(() => speakKorean(text), 300);
+    return;
+  }
+
   const u = new SpeechSynthesisUtterance(text);
-  u.lang = "ko-KR";
+  u.lang = 'ko-KR';
+  if (_koVoice) u.voice = _koVoice;
   u.rate = 0.82;
   u.pitch = 1.05;
+  u.volume = 1;
+  u.onstart = () => _setSpeaking(true);
+  u.onend   = () => _setSpeaking(false);
+  u.onerror = () => _setSpeaking(false);
   window.speechSynthesis.speak(u);
+}
+
+// Hook for visual speaking indicator
+function useSpeaking() {
+  const [speaking, setSpeaking] = useState(false);
+  useEffect(() => {
+    _speakListeners.add(setSpeaking);
+    return () => { _speakListeners.delete(setSpeaking); };
+  }, []);
+  return speaking;
+}
+
+// Korean voice availability check
+function useKoreanVoiceAvailable() {
+  const [available, setAvailable] = useState(true);
+  useEffect(() => {
+    const check = () => {
+      _loadVoices();
+      setAvailable(!!_koVoice);
+    };
+    setTimeout(check, 1000); // give browser time to load voices
+    if (window.speechSynthesis) window.speechSynthesis.onvoiceschanged = () => { _loadVoices(); setAvailable(!!_koVoice); };
+  }, []);
+  return available;
+}
+
+// Speaker button component — shows pulse when active
+function SpeakBtn({ text, size=16, className="" }: { text:string; size?:number; className?:string }) {
+  const speaking = useSpeaking();
+  return (
+    <button
+      onClick={(e) => { e.stopPropagation(); speakKorean(text); }}
+      className={"relative flex-shrink-0 " + className}
+      title="Tap to hear Korean pronunciation"
+    >
+      <div className={[
+        "rounded-full flex items-center justify-center transition-all",
+        speaking ? "bg-[#EF3E4A] scale-110 shadow-lg shadow-[#EF3E4A]/40" : "bg-[#EF3E4A] hover:bg-[#d63530]"
+      ].join(" ")} style={{width: size+16, height: size+16}}>
+        <Volume2 size={size} className="text-white"/>
+      </div>
+      {speaking && <span className="absolute inset-0 rounded-full bg-[#EF3E4A]/30 animate-ping"/>}
+    </button>
+  );
 }
 
 // ─── SM-2 SPACED REPETITION ───────────────────────────────────────
@@ -112,10 +207,7 @@ function PronunciationBridge({ soundsLike, roman, word }: { soundsLike:string; r
           <p className="text-[9px] text-[#EF3E4A]/60 mb-1 font-semibold">REAL KOREAN</p>
           <p className={cn("text-sm font-black transition-all", revealed ? "text-[#EF3E4A]" : "text-black/15")}>{revealed ? word : "tap →"}</p>
         </button>
-        <button onClick={() => speakKorean(word)}
-          className="w-9 h-9 rounded-full bg-[#EF3E4A] flex items-center justify-center flex-shrink-0 shadow-sm active:scale-95">
-          <Volume2 size={14} className="text-white" />
-        </button>
+        <SpeakBtn text={word} size={13}/>
       </div>
       {revealed && <p className="text-[11px] text-black/40 mt-3 pt-2 border-t border-black/6 leading-relaxed">{roman}</p>}
     </div>
@@ -150,15 +242,16 @@ function RecallCard({ wordObj, onRated }: { wordObj: typeof ALL_WORDS[0]; onRate
         ) : (
           <>
             <p className="text-[10px] font-bold text-[#EF3E4A] mb-2">ANSWER</p>
-            <button onClick={() => speakKorean(wordObj.word)} className="text-3xl font-black text-[#111] mb-2 flex items-center gap-2" style={{fontFamily:"Georgia,serif"}}>
-              {wordObj.word} <Volume2 size={16} className="text-[#EF3E4A]" />
-            </button>
+            <div className="flex items-center gap-3 mb-2">
+              <span className="text-3xl font-black text-[#111]" style={{fontFamily:"Georgia,serif"}}>{wordObj.word}</span>
+              <SpeakBtn text={wordObj.word} size={15}/>
+            </div>
             <p className="text-base font-bold text-[#EF3E4A] mb-3">{wordObj.english}</p>
             <div className="flex flex-wrap gap-1.5 justify-center">
               {wordObj.phrases.map((p,i) => (
-                <button key={i} onClick={() => speakKorean(p)} className="bg-[#6246EA]/8 text-[#6246EA] text-[10px] font-semibold px-2 py-1 rounded-lg flex items-center gap-1">
-                  {p} <Volume2 size={9}/>
-                </button>
+                  <div key={i} className="bg-[#6246EA]/8 text-[#6246EA] text-[10px] font-semibold px-2 py-1 rounded-lg flex items-center gap-1.5">
+                    {p} <SpeakBtn text={p} size={9}/>
+                  </div>
               ))}
             </div>
           </>
@@ -361,9 +454,10 @@ function PhraseChunkDrill({ wordObj, onDone }: { wordObj:typeof ALL_WORDS[0]; on
         </div>
         {shown && (
           <>
-            <button onClick={() => speakKorean(wordObj.phrases[pIdx])} className="flex items-center gap-2 bg-white border-2 border-black/6 rounded-2xl px-4 py-3 mb-4 w-full">
-              <Volume2 size={16} className="text-[#EF3E4A] flex-shrink-0"/>
+            <div className="flex items-center gap-3 bg-white border-2 border-black/6 rounded-2xl px-4 py-3 mb-4 w-full">
+              <SpeakBtn text={wordObj.phrases[pIdx]} size={15}/>
               <div><p className="text-base font-black text-[#111]">{wordObj.phrases[pIdx]}</p><p className="text-xs text-black/40">{wordObj.phraseMeanings[pIdx]}</p></div>
+            </div>
             </button>
             <button onClick={() => { setShown(false); setPIdx(i=>i+1); }} className="w-full py-3 rounded-full bg-[#6246EA] text-white font-black text-sm">
               {pIdx+1<wordObj.phrases.length?"Next phrase →":"All done — test me →"}
@@ -431,6 +525,7 @@ function LevelResultScreen({ level, onContinue }: { level:number; onContinue:()=
 
 function HomeScreen({ level, streak, dayMode, setDayMode, srCards, biteCount, onNav }: any) {
   const ids = dayMode==="weekday"?WEEKDAY_IDS:WEEKEND_IDS;
+  const voiceOk = useKoreanVoiceAvailable();
   const bite = getWord(ids[0]);
   const dueCount = srCards.filter((c:any)=>c.nextDue<=Date.now()).length;
   const learnedCount = srCards.filter((c:any)=>c.reps>0).length;
@@ -451,6 +546,12 @@ function HomeScreen({ level, streak, dayMode, setDayMode, srCards, biteCount, on
         </button>
         <div className="flex-1 bg-white border border-black/6 rounded-xl px-2 py-1.5 text-center"><p className="text-sm font-black text-[#111]">{biteCount}</p><p className="text-[9px] text-black/25 font-semibold">bites done</p></div>
       </div>
+      {!voiceOk && (
+        <div className="mx-4 mb-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 flex items-center gap-2">
+          <span className="text-sm">⚠️</span>
+          <p className="text-[10px] text-amber-700 font-semibold leading-tight">No Korean voice found on this device. Enable Korean TTS in system settings for audio.</p>
+        </div>
+      )}
       <div className="px-4 mb-3 flex gap-2">
         <button onClick={()=>setDayMode("weekday")} className={cn("flex-1 py-1.5 rounded-full text-[10px] font-bold",dayMode==="weekday"?"bg-[#111] text-white":"bg-black/5 text-black/35")}>Weekday ☀️</button>
         <button onClick={()=>setDayMode("weekend")} className={cn("flex-1 py-1.5 rounded-full text-[10px] font-bold",dayMode==="weekend"?"bg-[#EF3E4A] text-white":"bg-black/5 text-black/35")}>Weekend 🍺</button>
@@ -461,7 +562,7 @@ function HomeScreen({ level, streak, dayMode, setDayMode, srCards, biteCount, on
           <p className="text-[9px] font-bold text-[#EF3E4A] tracking-wider mb-1">TODAY'S BITE</p>
           <div className="flex items-baseline gap-2 mb-1">
             <h3 className="text-white text-2xl font-black" style={{fontFamily:"Georgia,serif"}}>{bite.word}</h3>
-            <button onClick={(e)=>{e.stopPropagation();speakKorean(bite.word);}} className="text-white/30 flex items-center gap-1 text-[10px]"><Volume2 size={10}/></button>
+            <SpeakBtn text={bite.word} size={10}/>
           </div>
           <p className="text-white/45 text-xs mb-3">{bite.english}</p>
           <span className="bg-[#EF3E4A] text-white text-[10px] font-bold px-3 py-1.5 rounded-full inline-flex items-center gap-1"><Play size={10} fill="white"/>Play</span>
@@ -488,9 +589,10 @@ function BiteScreen({ wordObj, dayMode, onDone, onBack }: any) {
         <p className="text-[9px] font-bold text-black/20 tracking-wider">{phases[phase].toUpperCase()} · {phase+1}/{phases.length}</p>
       </div>
       <div className="px-4 text-center mb-3 flex-shrink-0">
-        <button onClick={()=>speakKorean(wordObj.word)} className="text-3xl font-black text-[#111] inline-flex items-center gap-2" style={{fontFamily:"Georgia,serif"}}>
-          {wordObj.word} <Volume2 size={16} className="text-[#EF3E4A]"/>
-        </button>
+        <div className="inline-flex items-center gap-2">
+          <span className="text-3xl font-black text-[#111]" style={{fontFamily:"Georgia,serif"}}>{wordObj.word}</span>
+          <SpeakBtn text={wordObj.word} size={14}/>
+        </div>
         <p className="text-xs text-black/35">{wordObj.english}</p>
       </div>
       <div className="flex-1 overflow-y-auto px-4">
@@ -506,7 +608,10 @@ function BiteScreen({ wordObj, dayMode, onDone, onBack }: any) {
         {phase===3&&<div className="flex flex-col gap-3">
           <div className="bg-[#111] rounded-2xl p-4">
             <p className="text-[9px] font-bold text-[#EF3E4A] mb-2">AS HEARD IN</p>
-            <button onClick={()=>speakKorean(wordObj.dramaKo)} className="text-white font-bold text-sm mb-1 flex items-center gap-2">"{wordObj.dramaKo}" <Volume2 size={12}/></button>
+            <div className="text-white font-bold text-sm mb-1 flex items-center gap-2">
+              <span>"{wordObj.dramaKo}"</span>
+              <SpeakBtn text={wordObj.dramaKo} size={11}/>
+            </div>
             <p className="text-white/35 text-xs mb-2">{wordObj.dramaEn}</p>
             <p className="text-white/15 text-[10px]">{wordObj.show.ko} ({wordObj.show.en})</p>
           </div>
@@ -579,7 +684,10 @@ function ScanScreen({ onBack, onCommunity }: { onBack:()=>void; onCommunity:()=>
             <p className="text-sm text-black/45 mb-3">{picked.emoji} {picked.label}</p>
             <div className="h-px bg-black/6 mb-3"/>
             <p className="text-[9px] font-bold text-[#EF3E4A] mb-1">IN KOREAN</p>
-            <button onClick={()=>speakKorean(picked.ko.split(" ")[0])} className="text-xl font-black text-[#111] mb-3 flex items-center gap-2">{picked.ko} <Volume2 size={14} className="text-[#EF3E4A]"/></button>
+            <div className="flex items-center gap-3 mb-3">
+            <span className="text-xl font-black text-[#111]">{picked.ko}</span>
+            <SpeakBtn text={picked.ko.split(" ")[0]} size={13}/>
+          </div>
             <p className="text-[9px] font-bold text-[#6246EA] mb-1">WORD BREAKDOWN</p>
             <p className="text-xs text-black/50 leading-relaxed">{picked.note}</p>
           </div>
@@ -659,7 +767,10 @@ function ShareScreen({ word, level, streak, onBack }: any) {
         <div className="rounded-3xl bg-[#111] p-6 mb-4 relative overflow-hidden">
           <div className="text-8xl font-black text-white/4 absolute -right-3 -bottom-6 select-none" style={{fontFamily:"Georgia,serif"}}>ㅋ</div>
           <p className="text-[9px] font-bold text-[#EF3E4A] tracking-widest mb-3">K-PLAY KOREAN</p>
-          <button onClick={()=>speakKorean(word.word)} className="text-5xl font-black text-white mb-1 flex items-center gap-2" style={{fontFamily:"Georgia,serif"}}>{word.word} <Volume2 size={16} className="text-white/30"/></button>
+          <div className="flex items-center gap-3 mb-1">
+          <span className="text-5xl font-black text-white" style={{fontFamily:"Georgia,serif"}}>{word.word}</span>
+          <SpeakBtn text={word.word} size={15}/>
+        </div>
           <p className="text-white/40 text-sm mb-1">{word.roman}</p>
           <p className="text-white/25 text-sm mb-5">{word.english}</p>
           <div className="flex items-center gap-3">
